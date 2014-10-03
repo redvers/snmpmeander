@@ -1,0 +1,91 @@
+#!/usr/bin/env perl
+
+###############################################################################
+#
+#	snmplisten	-	Listens promiscuously for snmp traffic and
+#				logs it in a database for later analysis.
+#
+#	Author		-	Redvers Davies
+#
+###############################################################################
+
+$| = 1;
+
+use strict;
+use DBI;
+use YAML qw/LoadFile/;
+use Data::Dumper;
+use Net::PcapUtils;
+use NetPacket::Ethernet qw(:strip);
+use NetPacket::IP qw(:strip);
+use NetPacket::UDP;
+use NSNMP;
+use NSNMP::Simple;
+
+my $config = LoadFile(".config");
+print(Dumper $config);
+
+my $dbh = DBI->connect("DBI:Pg:dbname=".$config->{'dbname'}, $config->{'dbuser'}, $config->{'dbpass'}) || die;
+my $sth = $dbh->prepare("insert into raw_snmp (ipaddr, community, oid, result, ts) VALUES (?,?,?,?,NOW())");
+
+my $filter;
+my $err;
+my $pcap = Net::Pcap::open_live('eth0', 2500, 0, 0, \$err) || die;
+Net::Pcap::compile($pcap, \$filter, 'src port 161', 0, 0) && die 'Unable to compile packet capture filter';
+Net::Pcap::setfilter($pcap, $filter);
+Net::Pcap::loop($pcap, -1, \&process_pkt, '') || die;
+
+
+
+sub process_pkt {
+	my ($user, $hdr, $pkt) = @_;
+	my $ip_obj = NetPacket::IP->decode(eth_strip($pkt));
+	my $udp_obj = NetPacket::UDP->decode($ip_obj->{'data'});
+	my $dest = $ip_obj->{'dest_ip'};
+	my $src = $ip_obj->{'src_ip'};
+	my $data = $udp_obj->{'data'};
+	my $hex = unpack('H*', $data);
+
+	my $splat = NSNMP->decode($data);
+
+	my @varbindlist = $splat->varbindlist;
+
+	foreach my $varbind (@varbindlist) {
+		my $oid = NSNMP->decode_oid($varbind->[0]);
+		my $value = $varbind->[2];
+		my $type = unpack('c', $varbind->[1]);
+
+		if ($type == 6) {
+			# OID
+			$value = NSNMP->decode_oid($value);
+		} elsif ($type == 4) {
+			# Just a string
+		} elsif ($type == 64) {
+			# IP address / Netmask
+			$value = join '.', (unpack "C*", $value);
+	
+		} else {
+			# Treat as unpadded 32 bit integer
+			my $len = length($value);
+			my $t = "\0\0\0\0";
+	
+			substr($t, -$len, $len, $value);
+			$value = unpack('N', $t);
+		}
+	
+		wr_debug(sprintf("%d %s", $type, $src));
+		wr_debug(sprintf(" [%s]", $splat->{'community'}));
+		wr_debug(sprintf(" v(%s)", $splat->{'version'}));
+		wr_debug(sprintf(" {%s} =", $oid));
+		wr_debug(sprintf(" %s\n", $value));
+
+		$sth->execute($src, $splat->{'community'}, $oid, $value);
+
+	}
+}
+
+sub wr_debug {
+	while (my $line_in = shift) {
+		print(STDERR $line_in);
+	}
+}
